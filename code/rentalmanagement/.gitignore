@@ -1,0 +1,46 @@
+# Maven build output (root and all modules)
+/target/
+/**/target/
+
+# Packaged artifacts
+*.jar
+*.war
+*.ear
+
+# Logs
+*.log
+logs/
+
+# IntelliJ IDEA
+.idea/
+*.iml
+out/
+
+# Eclipse
+.classpath
+.project
+.settings/
+
+# VS Code workspace settings
+.vscode/
+
+# macOS / Windows
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+application-local.yml
+application-local.yaml
+
+# Temporary files
+*.tmp
+*.swp
+*.swo
+*~
+
+# OS / tooling caches
+.cache/
