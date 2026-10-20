@@ -5,7 +5,7 @@
                              https://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
 
-    <groupId>org.example.skaria</groupId>
+    <groupId>org.skaria.rentalmanagement</groupId>
     <artifactId>rental-management-parent</artifactId>
     <version>0.2.0-SNAPSHOT</version>
     <packaging>pom</packaging>
@@ -80,17 +80,17 @@
 
             <!-- Internal Sub-modules -->
             <dependency>
-                <groupId>org.example.skaria</groupId>
+                <groupId>org.skaria.rentalmanagement</groupId>
                 <artifactId>rental-shared</artifactId>
                 <version>${project.version}</version>
             </dependency>
             <dependency>
-                <groupId>org.example.skaria</groupId>
+                <groupId>org.skaria.rentalmanagement</groupId>
                 <artifactId>rental-identity</artifactId>
                 <version>${project.version}</version>
             </dependency>
             <dependency>
-                <groupId>org.example.skaria</groupId>
+                <groupId>org.skaria.rentalmanagement</groupId>
                 <artifactId>rental-core</artifactId>
                 <version>${project.version}</version>
             </dependency>
