@@ -55,6 +55,10 @@ public class Property extends Auditable {
     @ToString.Include
     private String propertyReference;
 
+    @Version
+    @Column(name = "version", nullable = false)
+    private Long version;   // wrapper type so Spring Data's isNew() works
+
     @Size(max = 200)
     @Column(name = "property_name", length = 200)
     private String propertyName;
