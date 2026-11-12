@@ -1,6 +1,6 @@
 # Domain Model & Database Design — Rental Management System
 
-Comprehensive domain model and PostgreSQL database design for a family-use rental property management system. Extends the existing V1 foundation (app_user, property, tenancy, tenant, audit_event) to cover property ownership (SCD Type 2), agency agreements, rent schedules/payments, income, expenses with owner allocation, agent fee schedules and statement reconciliation, contractors and work orders, compliance certificates, documents (S3 metadata), inspections, correspondence, legal notices, tenancy deposits, tax year reporting, reminders, and self-assessment packs. **32 tables** across 6 Spring modules.
+Comprehensive domain model and PostgreSQL database design for a family-use rental property management system. Extends the existing V1 foundation (app_user, property, tenancy, tenant, audit_event) to cover property ownership (SCD Type 2), agency agreements, rent schedules/payments, income, expenses with owner allocation, agent fee schedules and statement reconciliation, contractors and work orders, compliance certificates, documents (S3 metadata), inspections, correspondence, legal notices, tenancy deposits, tax year reporting, reminders, and self-assessment packs. **31 tables** (5 foundation + 26 domain) across 6 Spring modules. Authentication, usernames, passwords, MFA and roles are owned by Keycloak (OIDC / OAuth2 JWT resource server); the database stores only a local identity anchor (`app_user`).
 
 ## Confirmed Technology Decisions
 
@@ -15,10 +15,11 @@ Comprehensive domain model and PostgreSQL database design for a family-use renta
 | Money | `NUMERIC(12,2)` everywhere; no floating point |
 | Percentages | `NUMERIC(5,2)` for ownership; `NUMERIC(7,4)` for fee rates |
 | Audit | Append-only `audit_event` table; no enforcing triggers yet |
-| Roles | ADMIN > LANDLORD > ACCOUNTANT > FAMILY_VIEWER |
+| Identity / AuthN | Keycloak (OIDC); app is a Spring Security OAuth2 resource server validating JWT access tokens. No usernames or passwords in the DB |
+| Roles | ADMIN > LANDLORD > ACCOUNTANT > FAMILY_VIEWER — supplied by Keycloak as JWT claims (realm/client roles), mapped to Spring Security authorities; **not stored in the DB** |
 | Optimistic locking | `version BIGINT NOT NULL DEFAULT 0` on every mutable aggregate |
 | New enums | `VARCHAR(n) + CHECK` constraint (not PostgreSQL CREATE TYPE) |
-| Existing enums | Keep V1 PostgreSQL CREATE TYPE enums (user_role, property_type, tenancy_status) |
+| Existing enums | Keep V1 PostgreSQL CREATE TYPE enums (property_type, tenancy_status); `user_role` dropped (roles come from Keycloak) |
 | Soft-delete | `active BOOLEAN NOT NULL DEFAULT TRUE` + optional `deactivated_at TIMESTAMPTZ` (consistent with V1 pattern) |
 | PKs | UUID with `gen_random_uuid()` |
 | Timestamps | `TIMESTAMPTZ` (UTC) |
@@ -29,6 +30,8 @@ Comprehensive domain model and PostgreSQL database design for a family-use renta
 1. **Agent statement reconciliation**: Semi-automated with suggestions — system proposes matches by amount/date; user confirms or overrides.
 2. **Reminder channels**: One channel per rule; users create multiple rules for multiple channels (EMAIL, SMS, NTFY, IN_APP).
 3. **Expense category extensibility**: CHECK constraint (25 categories); migrate to reference table only if >30 categories or non-developer users need to add categories.
+4. **Identity model**: Keycloak owns authentication; `app_user` is a JIT-provisioned identity anchor keyed by `(idp_issuer, idp_subject)`. No `username` column, no password data, no role column/table/enum.
+5. **Roles**: Come from Keycloak JWT claims (`realm_access.roles` / `resource_access.<client>.roles`) and are mapped to authorities in Spring Security; role precedence is resolved in the application, not the DB.
 
 ---
 
@@ -51,8 +54,8 @@ Comprehensive domain model and PostgreSQL database design for a family-use renta
 
 | Module | Aggregate Roots | Justification |
 |--------|----------------|---------------|
-| **rental-shared** | AuditEvent, Auditable base | Cross-cutting: audit, enums, money utils, error types |
-| **rental-identity** | AppUser | Keycloak JIT sync, roles, identity anchoring |
+| **rental-shared** | AuditEvent, Auditable base | Cross-cutting: audit, enums, money utils, error types, `CurrentActorProvider` SPI (actor UUID for auditing/FKs) |
+| **rental-identity** | AppUser | Keycloak JIT provisioning (upsert on issuer+subject), profile-snapshot refresh, JWT → authority mapping, `CurrentActorProvider` implementation |
 | **rental-core** | Property, PropertyOwner, AgencyAgreement, AgentFeeSchedule, Tenancy (w/ Tenant, TenancyDeposit), RentSchedule, RentPayment, IncomeLine, Expense (w/ ExpenseAllocation), Contractor, WorkOrder, ComplianceCertificate, Inspection (w/ InspectionItem), Correspondence, LegalNotice, AgentStatement (w/ AgentStatementLine), ReminderRule (w/ ReminderInstance) | Core domain — property, tenancy, finance, maintenance, compliance, agency, reminders |
 | **rental-document** | Document (w/ DocumentVersion, DocumentLink) | Document lifecycle, S3 interaction, OCR status, search vectors |
 | **rental-tax** | TaxYear, TaxYearSummary, SelfAssessmentPack | Tax reporting, SA105 mapping, year locking |
@@ -65,7 +68,7 @@ rental-shared  (base — no upward dependencies)
      ↑
 rental-identity  (depends on shared)
      ↑
-rental-core  (depends on shared, identity)
+rental-core  (depends on shared only — actor via CurrentActorProvider SPI)
      ↑
 rental-document  (depends on shared, identity)
      ↑
@@ -75,6 +78,8 @@ rental-app  (composition root — depends on all)
 ```
 
 New Maven modules to add to parent POM: `rental-document`, `rental-tax`.
+
+`rental-core` must not depend on `rental-identity`. It obtains the current actor's `app_user.id` through the `CurrentActorProvider` SPI declared in `rental-shared` (also backing Spring Data `AuditorAware` for `created_by`/`updated_by`). `rental-identity` implements the SPI by resolving the JWT `iss` + `sub` to `app_user.id`, provisioning the row just-in-time if absent. User FK columns in core (`owner_id`, `raised_by_id`, …) are plain `UUID` attributes, not JPA associations to `AppUser`.
 
 ---
 
@@ -86,23 +91,143 @@ New Maven modules to add to parent POM: `rental-document`, `rental-tax`.
 
 ```
 AppUser (rental-identity)
-├── id : UUID [PK]
-├── username : VARCHAR(100) [UNIQUE]
-├── display_name : VARCHAR(200)
-├── email : VARCHAR(320)
-├── role : user_role [PG ENUM]
-├── active : BOOLEAN
-├── idp_issuer : VARCHAR(500) [NEW]
-├── idp_subject : VARCHAR(255)
-├── version : BIGINT [NEW]
+├── id : UUID [PK]                      — internal actor id; target of all user FKs
+├── idp_issuer : TEXT [NOT NULL]        — JWT iss (Keycloak realm issuer URL)
+├── idp_subject : TEXT [NOT NULL]       — JWT sub (immutable Keycloak user id)
+├── display_name : VARCHAR(200) [NULL]  — snapshot of name claim, display only
+├── email : VARCHAR(320) [NULL]         — snapshot of email claim, notifications only
+├── active : BOOLEAN                    — app-level soft-disable
+├── first_seen_at : TIMESTAMPTZ         — JIT provisioning time
+├── last_seen_at : TIMESTAMPTZ          — last authenticated request/login
+├── version : BIGINT
 └── audit columns (created_at, updated_at, created_by, updated_by)
 ```
 
-**Business rules enforced at DB level**:
-- `UNIQUE(idp_issuer, idp_subject)` — replaces V1's `UNIQUE(idp_subject)` to handle multi-realm
-- `UNIQUE(username)` — retained
-- role is a PostgreSQL enum (existing V1)
+`app_user` is a **local identity anchor**, not a user directory. It exists so that FKs (`created_by`/`updated_by`, `audit_event.actor_id`, `property_owner.owner_id`, `document.uploaded_by_id`, `tax_year.locked_by_id`, approvals, etc.) and per-user application data have a stable target.
 
+**Business rules enforced at DB level**:
+- `UNIQUE(idp_issuer, idp_subject)` — the only authentication key (multi-realm safe)
+- `idp_issuer`, `idp_subject` are `NOT NULL` — rows exist only after a successful authentication
+- `CHECK(last_seen_at >= first_seen_at)`
+- No `username`, no password/credential columns, no `role` column, no `user_role` enum, no `role`/`user_role` tables
+- `email` is **not** unique and never used as a key (it can change in Keycloak or be shared/absent)
+
+**Provisioning (JIT)**: on the first authenticated request, `rental-identity` upserts on `(idp_issuer, idp_subject)`:
+```sql
+INSERT INTO app_user (idp_issuer, idp_subject, display_name, email)
+VALUES (:iss, :sub, :name, :email)
+ON CONFLICT (idp_issuer, idp_subject) DO UPDATE
+   SET display_name = EXCLUDED.display_name,
+       email        = EXCLUDED.email,
+       last_seen_at = now(),
+       updated_at   = now(),
+       version      = app_user.version + 1;
+```
+Refresh the snapshot at most once per session/login (or when claims differ) rather than on every request, to avoid write amplification. The resolved `app_user.id` is cached per request in the security context.
+
+**Roles & authorities**: roles are not persisted. Keycloak issues them as realm roles (`realm_access.roles`) and/or client roles (`resource_access.<client-id>.roles`). A custom `JwtAuthenticationConverter` (with a `Converter<Jwt, Collection<GrantedAuthority>>`) maps them to `ROLE_ADMIN`, `ROLE_LANDLORD`, `ROLE_ACCOUNTANT`, `ROLE_FAMILY_VIEWER`. Precedence ADMIN > LANDLORD > ACCOUNTANT > FAMILY_VIEWER is expressed with a Spring Security `RoleHierarchy` bean, so `@PreAuthorize("hasRole('ACCOUNTANT')")` is satisfied by LANDLORD and ADMIN. Role changes take effect when a new access token is issued (token lifetime bounds staleness).
+
+**ID token vs access token**: the backend is a resource server and only sees the **access token**. Configure Keycloak client scopes / protocol mappers so the access token carries `realm_access`/`resource_access` roles (default) and the profile claims needed for the snapshot (`name` or `preferred_username`, `email`). ID-token-only claims are not visible to the API; the SPA uses the ID token purely for its own UI. `preferred_username` may be used as a fallback for `display_name` but is never stored as a username or used as a key.
+
+#### Responsibility boundary: Keycloak vs application
+
+| Concern | Keycloak | Application (Spring / PostgreSQL) |
+|---------|----------|-----------------------------------|
+| Login, passwords, MFA, password reset, account lockout | ✅ Owns | — |
+| Usernames, identity-provider accounts, federation | ✅ Owns | — (not stored) |
+| User profile source of truth (name, email) | ✅ Owns | Read-only snapshot in `app_user.display_name` / `email` |
+| Role assignment (ADMIN, LANDLORD, ACCOUNTANT, FAMILY_VIEWER) | ✅ Owns (realm/client roles) | — (not stored) |
+| Token issuance, signing, expiry, refresh | ✅ Owns | Validates JWT signature, `iss`, `exp`, audience |
+| Claim → authority mapping, role precedence | — | ✅ `JwtAuthenticationConverter` + `RoleHierarchy` |
+| Authorization rules (who may do what, tax-year lock, approvals) | — | ✅ `@PreAuthorize` / service-layer checks |
+| Stable internal actor id for FKs and audit | — | ✅ `app_user.id`, JIT-provisioned from (`iss`, `sub`) |
+| Account enable/disable | ✅ Primary (disable user / revoke sessions) | Optional app-level block via `app_user.active = FALSE` |
+| Audit trail of domain changes | — | ✅ `audit_event` (actor id + display-name snapshot) |
+
+The big picture
+The app uses Keycloak to log people in. The database never stores passwords or roles. But your tables still need to say "who did this?" (who raised a work order, who owns a property, who last edited a record). So the app keeps a small local row per person, app_user, whose only job is to give each person a stable UUID that other tables can reference.
+
+Step by step
+1. The CurrentActorProvider SPI (in rental-shared)
+
+An SPI (service provider interface) is just a Java interface, roughly:
+
+java
+
+Copy
+public interface CurrentActorProvider {
+UUID currentActorId();   // app_user.id of whoever is making this request
+}
+Try:
+|
+It lives in rental-shared because every module can depend on that one without depending on each other. Core modules (properties, expenses, work orders) call it without knowing how identity works. They only know "I can ask for the current actor's id."
+
+2. Spring Data auditing (AuditorAware)
+
+Spring Data JPA can fill created_by and updated_by automatically through AuditorAware<UUID>. The same SPI backs it, roughly:
+
+java
+
+Copy
+@Bean
+AuditorAware<UUID> auditorAware(CurrentActorProvider p) {
+return () -> Optional.of(p.currentActorId());
+}
+Try:
+|
+So one source of truth gives you both explicit uses (raised_by_id = provider.currentActorId()) and automatic audit columns.
+
+3. rental-identity implements the SPI
+
+This module is the only one that knows about JWTs and app_user. On each call it does the following:
+
+Reads the authenticated JWT from the Spring Security context.
+Takes the iss (issuer, i.e. your Keycloak realm URL) and sub (the user's unique id in that realm).
+Looks up app_user by UNIQUE(idp_issuer, idp_subject).
+If a row exists, it returns its id.
+If not, it inserts one. This is the just-in-time step. It also stores display_name and email as snapshots from the token claims.
+Implement the insert as an upsert (INSERT ... ON CONFLICT (idp_issuer, idp_subject) DO NOTHING, then select). Two simultaneous first requests from a new user would otherwise race and one would fail on the unique constraint. You can also cache issuer+subject → id in memory, so the database is not hit on every request.
+
+4. Why issuer + subject, not email or username
+
+sub is stable and unique only within one issuer. Pairing it with iss stays correct if you ever change realms or add another identity provider. Emails and usernames can change, so they are kept only as nullable display snapshots.
+
+5. Plain UUID columns, not JPA associations
+
+In core entities, you map the user reference like this:
+
+java
+
+Copy
+@Column(name = "raised_by_id")
+private UUID raisedById;
+Try:
+|
+and not like this:
+
+java
+
+Copy
+@ManyToOne private AppUser raisedBy;   // avoid
+Try:
+|
+Reasons:
+
+Module boundaries: AppUser lives in rental-identity. A JPA association would force core to depend on identity, which breaks the "core only depends on shared" rule and risks cycles.
+No accidental loading: no lazy-loading surprises or N+1 queries when you only need an id.
+Simpler entities and tests: you can create a work order in a test with any UUID, without building an AppUser.
+Integrity is still enforced by the database foreign key in the Flyway schema. JPA just doesn't model the relationship.
+If you need the person's name for a screen, ask rental-identity through a small query service (e.g. UserDirectory.displayNames(Set<UUID>)) rather than joining across modules.
+
+Flow at a glance
+Request + JWT → Spring Security → core service
+→ CurrentActorProvider.currentActorId()
+→ (rental-identity) iss+sub → app_user.id (insert if missing)
+→ save entity with created_by / raised_by_id = that UUID
+Things to watch
+Provision before any audited write (the auditor is called at flush time, so a missing row must be created in a transaction that is visible to the FK).
+Background jobs (reminders, imports) have no JWT. Give them a fixed "system" actor row, or have the provider return it when there is no authentication.
+audit_event keeps an actor_display_name snapshot, so history stays readable even if a user's name later changes.
 ---
 
 ### Context 2: Property & Ownership
@@ -408,15 +533,24 @@ ReminderRule                             ReminderInstance
 
 ### V1 Schema Extensions (Migration V2)
 
-#### app_user — ADD columns
+#### app_user — identity anchor (replaces V1 definition)
 
 | Column | Type | Nullable | Default | Constraints | Description |
 |--------|------|----------|---------|-------------|-------------|
-| idp_issuer | VARCHAR(500) | NULL | | | Keycloak realm issuer URL |
+| id | UUID | NOT NULL | gen_random_uuid() | PK | Internal actor id; resolved from JWT (iss, sub) by `CurrentActorProvider` |
+| idp_issuer | TEXT | NOT NULL | | UNIQUE(idp_issuer, idp_subject) | JWT `iss` — Keycloak realm issuer URL |
+| idp_subject | TEXT | NOT NULL | | UNIQUE(idp_issuer, idp_subject) | JWT `sub` — immutable Keycloak user id |
+| display_name | VARCHAR(200) | NULL | | | Profile snapshot (name claim), refreshed on login; display only |
+| email | VARCHAR(320) | NULL | | (not unique) | Profile snapshot (email claim), refreshed on login; notifications only |
+| active | BOOLEAN | NOT NULL | TRUE | | App-level soft-disable; Keycloak remains primary for account disable |
+| first_seen_at | TIMESTAMPTZ | NOT NULL | now() | CHECK(last_seen_at >= first_seen_at) | JIT provisioning time |
+| last_seen_at | TIMESTAMPTZ | NOT NULL | now() | | Last authenticated request/login |
 | version | BIGINT | NOT NULL | 0 | | Optimistic lock |
+| created_at / updated_at / created_by / updated_by | | | | | Standard audit columns |
 
-- **DROP**: `UNIQUE(idp_subject)` → **ADD**: `UNIQUE(idp_issuer, idp_subject)`
-- **Backfill**: `UPDATE app_user SET idp_issuer = 'https://auth.homelab.internal/realms/rental' WHERE idp_subject IS NOT NULL`
+- **Removed vs earlier draft**: `username` + `UNIQUE(username)`, `role` (`user_role` enum) and the `user_role` type itself. `idp_issuer`/`idp_subject` are now `NOT NULL` (rows are created only on authentication) and `display_name` is nullable (claim may be absent).
+- No backfill needed: V1 is a clean baseline.
+- Table and column `COMMENT ON` statements document the Keycloak ownership boundary.
 
 #### property — ADD column
 
@@ -453,6 +587,9 @@ Note: `ownership_percentage` retained but deprecated. Application reads from `pr
 |--------|------|----------|---------|-------------|-------------|
 | entity_type | VARCHAR(50) | NULL | | | Alias for aggregate_type; backfill |
 | entity_id | UUID | NULL | | | Alias for aggregate_id; backfill |
+
+- `actor_id` → app_user.id, resolved from the JWT (iss, sub) via `CurrentActorProvider`.
+- `actor_username` replaced by `actor_display_name VARCHAR(200)` — a point-in-time copy of `app_user.display_name` when the event was written (no usernames are stored).
 
 ---
 
@@ -1059,6 +1196,12 @@ Every mutable table includes:
 - `updated_at TIMESTAMPTZ NOT NULL DEFAULT now()` — updated on every mutation
 - `created_by UUID` — app_user.id, set by Spring Data JPA `@CreatedBy`
 - `updated_by UUID` — app_user.id, set by `@LastModifiedBy`
+- Auditor resolution: `AuditorAware<UUID>` delegates to the `CurrentActorProvider` SPI (rental-shared), implemented in rental-identity by mapping JWT `iss` + `sub` → `app_user.id` (JIT-provisioning if needed). Columns are plain UUIDs (no DB FK) so core tables stay decoupled from identity.
+
+### Security & Identity
+- Spring Security OAuth2 resource server (`spring-boot-starter-oauth2-resource-server`), `issuer-uri` = Keycloak realm; JWT signature, `iss`, `exp` and audience are validated on every request.
+- Authorities come from Keycloak JWT claims (`realm_access.roles`, `resource_access.<client>.roles`) via a custom `JwtAuthenticationConverter`; precedence ADMIN > LANDLORD > ACCOUNTANT > FAMILY_VIEWER via `RoleHierarchy`. Nothing role-related is persisted.
+- The database never stores usernames, passwords, credentials or roles. See *Responsibility boundary: Keycloak vs application* (Context 1).
 
 Child/immutable tables (expense_allocation, document_version, document_link, inspection_item, agent_statement_line) have only `created_at` and `created_by`.
 
@@ -1081,7 +1224,7 @@ Child/immutable tables (expense_allocation, document_version, document_link, ins
 - Java: `BigDecimal`; API: decimal string
 
 ### Enum Strategy
-- **Existing V1**: PostgreSQL CREATE TYPE enums (user_role, property_type, tenancy_status) — kept as-is
+- **Existing V1**: PostgreSQL CREATE TYPE enums (property_type, tenancy_status) — kept as-is; `user_role` removed (roles come from Keycloak JWT claims)
 - **All new columns**: `VARCHAR(n) + CHECK` constraint — avoids ALTER TYPE migration issues
 - **Java**: Java enums with `@Enumerated(EnumType.STRING)` + `@Column(columnDefinition = "VARCHAR(50)")`
 
@@ -1114,7 +1257,7 @@ Child/immutable tables (expense_allocation, document_version, document_link, ins
 
 | Migration | Scope | Description |
 |-----------|-------|-------------|
-| V2 | V1 extensions | Add version to app_user/property/tenancy/tenant; add idp_issuer; btree_gist + GiST exclusion; audit_event entity_type/entity_id |
+| V2 | V1 extensions | Add version to app_user/property/tenancy/tenant; app_user identity-anchor shape (idp_issuer, no username/role); btree_gist + GiST exclusion; audit_event entity_type/entity_id |
 | V3 | Property & Ownership | property_owner, agency_agreement, agent_fee_schedule; seed property_owner from existing ownership_percentage |
 | V4 | Tenancy & Rent | rent_schedule, rent_payment, tenancy_deposit; seed rent_schedule from tenancy.monthly_rent |
 | V5 | Finance | income_line, expense, expense_allocation |
@@ -1138,6 +1281,8 @@ Each migration is independently deployable. Tables without dependent application
 | GiST exclusion constraint conflicts with app-layer overlap check | Remove app-layer check; rely solely on DB constraint; catch exclusion-violation exception → 409 Conflict |
 | 22 new tables in one design iteration | Split into 10 separate Flyway migrations by bounded context; implement incrementally; inert until application code written |
 | tax_year_summary aggregation accuracy | Summary rows always is_draft=TRUE until reviewed; recalculation on approved income/expense change; never auto-used for tax filing |
+| Historical audit display uses cached names | `audit_event.actor_display_name` and `app_user.display_name` are snapshots; a user renamed in Keycloak shows the old name on past events (by design: point-in-time record) and the new name on `app_user` after next login. `actor_id` remains the authoritative link |
+| Stale roles after change in Keycloak | Roles live only in the token; keep access-token lifetime short (e.g. 5–15 min) so changes propagate on refresh |
 | Expense allocation sum validation | Application-layer check: expense_allocation rows must sum to expense.amount; validation in service layer with clear error message |
 
 ---
@@ -1145,3 +1290,14 @@ Each migration is independently deployable. Tables without dependent application
 ## Open Design Decisions
 
 None remaining — all questions resolved.
+
+### Decision Log — Identity (Keycloak / OAuth2)
+
+| # | Decision | Rationale |
+|---|----------|-----------|
+| D-ID-1 | Keycloak owns authentication (login, passwords, MFA, IdP accounts); **`username` is not stored** | Single source of truth; no credential data in the app DB; usernames can change in Keycloak |
+| D-ID-2 | **Roles come from Keycloak JWT claims**; no role column, `user_role` enum or role tables | App uses the JWT / OAuth2 token workflow; authorities mapped by `JwtAuthenticationConverter`, precedence by `RoleHierarchy` |
+| D-ID-3 | `app_user` = identity anchor keyed by `UNIQUE(idp_issuer, idp_subject)`, JIT upsert on first authenticated request | Stable UUID target for FKs and audit; multi-realm safe |
+| D-ID-4 | `display_name` / `email` cached as nullable, non-unique snapshots refreshed from token claims | Show "edited by John" without calling Keycloak. Trade-off: historical audit display uses the cached snapshot, not the live Keycloak name |
+| D-ID-5 | Claims are read from the **access token** (resource server never sees the ID token) | Keycloak mappers must add profile claims to the access token |
+| D-ID-6 | `rental-core` does not depend on `rental-identity`; actor id via `CurrentActorProvider` SPI in `rental-shared` | Keeps the domain core independent of the identity mechanism |
