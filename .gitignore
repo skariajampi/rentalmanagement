@@ -44,3 +44,4 @@ application-local.yaml
 
 # OS / tooling caches
 .cache/
+.ai/
