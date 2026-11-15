@@ -18,6 +18,8 @@
         <module>rental-identity</module>
         <module>rental-core</module>
         <module>rental-app</module>
+        <module>rental-document</module>
+        <module>rental-tax</module>
     </modules>
 
     <properties>
