@@ -58,23 +58,18 @@ CREATE TYPE tenancy_status AS ENUM (
 -- Roles arrive as JWT claims and are mapped to Spring Security authorities.
 -- ---------------------------------------------------------------------------
 CREATE TABLE app_user (
-    id              UUID         NOT NULL DEFAULT gen_random_uuid(),
-    idp_issuer      TEXT         NOT NULL,                 -- JWT iss (Keycloak realm issuer URL)
-    idp_subject     TEXT         NOT NULL,                 -- JWT sub (Keycloak user id)
-    display_name    VARCHAR(200),                          -- Snapshot of name claim; display only
-    email           VARCHAR(320),                          -- Snapshot of email claim; not a key, not unique
-    active          BOOLEAN      NOT NULL DEFAULT TRUE,
-    first_seen_at   TIMESTAMPTZ  NOT NULL DEFAULT now(),   -- JIT provisioning time
-    last_seen_at    TIMESTAMPTZ  NOT NULL DEFAULT now(),   -- Last authenticated request/login
-    version         BIGINT       NOT NULL DEFAULT 0,       -- Optimistic lock
-    created_at      TIMESTAMPTZ  NOT NULL DEFAULT now(),
-    updated_at      TIMESTAMPTZ  NOT NULL DEFAULT now(),
-    created_by      UUID,
-    updated_by      UUID,
+                          id            UUID         NOT NULL DEFAULT gen_random_uuid(),
+                          idp_issuer    TEXT         NOT NULL,
+                          idp_subject   TEXT         NOT NULL,
+                          display_name  VARCHAR(200),
+                          email         VARCHAR(320),
+                          first_seen_at TIMESTAMPTZ  NOT NULL DEFAULT now(),
+                          last_seen_at  TIMESTAMPTZ  NOT NULL DEFAULT now(),
+                          version       BIGINT       NOT NULL DEFAULT 0,
 
-    CONSTRAINT pk_app_user                        PRIMARY KEY (id),
-    CONSTRAINT uq_app_user_idp                    UNIQUE (idp_issuer, idp_subject),
-    CONSTRAINT chk_app_user_seen                  CHECK (last_seen_at >= first_seen_at)
+                          CONSTRAINT pk_app_user  PRIMARY KEY (id),
+                          CONSTRAINT uq_app_user_idp UNIQUE (idp_issuer, idp_subject),
+                          CONSTRAINT chk_app_user_seen CHECK (last_seen_at >= first_seen_at)
 );
 
 COMMENT ON TABLE  app_user               IS 'Local identity anchor for Keycloak principals; JIT-provisioned via upsert on (idp_issuer, idp_subject). Keycloak owns authentication, usernames, passwords, MFA and roles; none are stored here. Exists so FKs (created_by/updated_by, audit actor, owner, uploaded_by, locked_by, generated_by) have a stable target.';

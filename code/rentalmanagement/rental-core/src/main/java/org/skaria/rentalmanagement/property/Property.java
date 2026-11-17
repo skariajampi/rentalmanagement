@@ -3,7 +3,6 @@ package org.skaria.rentalmanagement.property;
 import jakarta.persistence.*;
 import jakarta.validation.constraints.*;
 import lombok.*;
-import org.skaria.rentalmanagement.shared.Auditable;
 import org.skaria.rentalmanagement.shared.PropertyType;
 import org.hibernate.annotations.UuidGenerator;
 import org.skaria.rentalmanagement.tenancy.Tenancy;
@@ -36,7 +35,7 @@ import java.util.UUID;
 @Builder
 @ToString(onlyExplicitlyIncluded = true)
 @EqualsAndHashCode(onlyExplicitlyIncluded = true, callSuper = false)
-public class Property extends Auditable {
+public class Property  {
 
     @Id
     @UuidGenerator

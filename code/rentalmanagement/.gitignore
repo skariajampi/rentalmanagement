@@ -33,8 +33,7 @@ Desktop.ini
 .env
 .env.*
 !.env.example
-application-local.yml
-application-local.yaml
+
 
 # Temporary files
 *.tmp
